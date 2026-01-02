@@ -29,19 +29,6 @@ Auto-Claude transforms Claude Code into a persistent development partner by wrap
 
 The magic happens in how Claude hands off knowledge between iterations. Just like developers use task lists and documentation, Claude maintains a shared markdown file—`SHARED_TASK_NOTES.md`—that evolves as the project progresses. This external memory prevents context drift and enables genuine multi-day projects.
 
-## The Origin Story: A Saturday Experiment
-
-It started with a joke. My friend [Namanyay](https://nmn.gl) (founder of Giga AI) saw my first prototype—literally just this:
-
-```bash
-while true; do
-  claude --dangerously-skip-permissions "Increase test coverage [...] write notes for the next developer in TASKS.md"
-  sleep 1
-done
-```
-
-He called it "genius and hilarious." That sparked a weekend coding sprint. The elegant simplicity—a while loop—revealed something profound: persistence matters more than sophistication. By Sunday evening, the prototype had evolved into a production-ready orchestrator that integrates seamlessly with GitHub's PR workflow.
-
 ## How the Loop Works
 
 Each iteration follows a carefully designed cycle:
