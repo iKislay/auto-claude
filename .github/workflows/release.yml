@@ -1,0 +1,307 @@
+name: Create Release
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          chmod +x tests/setup.sh
+          ./tests/setup.sh
+
+      - name: Run tests
+        run: ./tests/libs/bats/bin/bats tests/test_auto_claude.bats
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Fetch all history for all tags and branches
+          fetch-tags: true # Explicitly fetch all tags
+
+      - name: Get latest tag
+        id: get_latest_tag
+        run: |
+          # Fetch all tags to ensure we have the latest
+          git fetch --tags --force
+
+          # Get the latest production release tag (excluding pre-release tags like -dev, -pr, -alpha, -beta, -rc)
+          # Filter out tags with hyphens (pre-release markers) and get the latest semver tag
+          LATEST_TAG=$(git tag -l "v*.*.*" | grep -v "-" | sort -V | tail -n 1)
+
+          # If no production tags exist, use v0.0.0
+          if [ -z "$LATEST_TAG" ]; then
+            LATEST_TAG="v0.0.0"
+          fi
+
+          echo "latest_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "Latest production tag: $LATEST_TAG"
+
+      - name: Determine version bump
+        id: version_bump
+        run: |
+          LATEST_TAG="${{ steps.get_latest_tag.outputs.latest_tag }}"
+
+          # Remove 'v' prefix if present
+          VERSION=${LATEST_TAG#v}
+
+          # Split version into major.minor.patch
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+
+          # Get commit messages since last tag
+          if [ "$LATEST_TAG" = "v0.0.0" ]; then
+            COMMITS=$(git log --pretty=format:"%s" --no-merges)
+          else
+            COMMITS=$(git log ${LATEST_TAG}..HEAD --pretty=format:"%s" --no-merges)
+          fi
+
+          echo "Commits since last release:"
+          echo "$COMMITS"
+
+          # Determine bump type based on commit messages
+          # Look for conventional commit prefixes and gitmoji
+          if echo "$COMMITS" | grep -qiE "^(breaking|BREAKING CHANGE|feat!|fix!|chore!|:boom:)"; then
+            # Major version bump for breaking changes
+            # :boom: = breaking changes
+            MAJOR=$((MAJOR + 1))
+            MINOR=0
+            PATCH=0
+            BUMP_TYPE="major"
+          elif echo "$COMMITS" | grep -qiE "^(feat|:sparkles:)"; then
+            # Minor version bump for new features
+            # :sparkles: = new feature
+            MINOR=$((MINOR + 1))
+            PATCH=0
+            BUMP_TYPE="minor"
+          else
+            # Patch version bump for everything else
+            # :bug: = bug fix, :ambulance: = critical hotfix, etc.
+            PATCH=$((PATCH + 1))
+            BUMP_TYPE="patch"
+          fi
+
+          NEW_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "bump_type=$BUMP_TYPE" >> $GITHUB_OUTPUT
+          echo "New version: $NEW_VERSION (${BUMP_TYPE} bump)"
+
+      - name: Check if version changed
+        id: check_version
+        run: |
+          LATEST_TAG="${{ steps.get_latest_tag.outputs.latest_tag }}"
+          NEW_VERSION="${{ steps.version_bump.outputs.new_version }}"
+
+          if [ "$LATEST_TAG" = "$NEW_VERSION" ]; then
+            echo "⏭️  No new commits to release (version unchanged: $LATEST_TAG)"
+            echo "should_release=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Check if auto_claude.sh has changed since last tag
+          if [ "$LATEST_TAG" != "v0.0.0" ]; then
+            if ! git diff --quiet ${LATEST_TAG}..HEAD -- auto_claude.sh; then
+              echo "✅ auto_claude.sh has changed since $LATEST_TAG"
+              SCRIPT_CHANGED=true
+            else
+              echo "⏭️  auto_claude.sh unchanged since $LATEST_TAG"
+              SCRIPT_CHANGED=false
+            fi
+          else
+            # First release, script is considered changed
+            SCRIPT_CHANGED=true
+          fi
+
+          # Get commits since last tag
+          if [ "$LATEST_TAG" = "v0.0.0" ]; then
+            COMMITS=$(git log --pretty=format:"%s" --no-merges)
+          else
+            COMMITS=$(git log ${LATEST_TAG}..HEAD --pretty=format:"%s" --no-merges)
+          fi
+
+          # Check if all commits are test/CI/docs related
+          # Test-related gitmojis: :construction_worker:, :white_check_mark:, :green_heart:, :pencil:
+          # Conventional commits: test:, ci:, docs:
+          TEST_ONLY=true
+          while IFS= read -r commit; do
+            if ! echo "$commit" | grep -qiE "^(:construction_worker:|:white_check_mark:|:green_heart:|:pencil:|test:|ci:|docs:)"; then
+              TEST_ONLY=false
+              break
+            fi
+          done <<< "$COMMITS"
+
+          # Skip release if script unchanged OR all commits are test-only
+          if [ "$SCRIPT_CHANGED" = "false" ]; then
+            echo "⏭️  Skipping release: auto_claude.sh unchanged"
+            echo "should_release=false" >> $GITHUB_OUTPUT
+          elif [ "$TEST_ONLY" = "true" ]; then
+            echo "⏭️  Skipping release: only test/CI/docs changes"
+            echo "should_release=false" >> $GITHUB_OUTPUT
+          else
+            echo "✅ Will create release: $LATEST_TAG → $NEW_VERSION"
+            echo "should_release=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update version in script
+        if: steps.check_version.outputs.should_release == 'true'
+        run: |
+          NEW_VERSION="${{ steps.version_bump.outputs.new_version }}"
+
+          # Update version in auto_claude.sh (replace any existing version)
+          sed -i 's/^VERSION=".*"/VERSION="'"$NEW_VERSION"'"/' auto_claude.sh
+
+          echo "✅ Updated version to $NEW_VERSION in auto_claude.sh"
+
+      - name: Regenerate checksum
+        if: steps.check_version.outputs.should_release == 'true'
+        run: |
+          # Generate sha256 checksum alongside the script
+          sha256sum auto_claude.sh > auto_claude.sh.sha256
+          cat auto_claude.sh.sha256
+
+          echo "✅ Regenerated auto_claude.sh.sha256"
+
+      - name: Generate release notes
+        id: release_notes
+        if: steps.check_version.outputs.should_release == 'true'
+        run: |
+          LATEST_TAG="${{ steps.get_latest_tag.outputs.latest_tag }}"
+          NEW_VERSION="${{ steps.version_bump.outputs.new_version }}"
+
+          # Get commits since last tag
+          if [ "$LATEST_TAG" = "v0.0.0" ]; then
+            COMMITS=$(git log --pretty=format:"- %s (%h)" --no-merges)
+          else
+            COMMITS=$(git log ${LATEST_TAG}..HEAD --pretty=format:"- %s (%h)" --no-merges)
+          fi
+
+          # Create release notes
+          cat > release_notes.md << EOF
+          ## What's Changed
+
+          $COMMITS
+
+          **Full Changelog**: https://github.com/${{ github.repository }}/compare/${LATEST_TAG}...${NEW_VERSION}
+
+          ## Installation
+
+          Install with a single command:
+
+          \`\`\`bash
+          curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/refs/tags/${NEW_VERSION}/install.sh | bash
+          \`\`\`
+
+          Or download the script directly:
+
+          \`\`\`bash
+          curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/refs/tags/${NEW_VERSION}/auto_claude.sh -o auto-claude
+          chmod +x auto-claude
+          sudo mv auto-claude /usr/local/bin/
+          \`\`\`
+          EOF
+
+          echo "Release notes generated"
+          cat release_notes.md
+
+      - name: Generate CHANGELOG
+        if: steps.check_version.outputs.should_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NEW_VERSION="${{ steps.version_bump.outputs.new_version }}"
+
+          # Check if CHANGELOG.md exists
+          if [ ! -f CHANGELOG.md ]; then
+            echo "Creating new CHANGELOG.md..."
+            echo "# CHANGELOG" > CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            
+            # Fetch all releases using gh api (because gh release list doesn't return body)
+            # We use jq to format the output
+            gh api repos/${{ github.repository }}/releases --paginate | jq -r '.[] | "## [" + .tag_name + "] - " + (.published_at | split("T")[0]) + "\n\n" + ((.body // "") | gsub("## "; "### ")) + "\n\n"' >> CHANGELOG.md
+          fi
+
+          # Prepend new release notes to CHANGELOG.md
+          # We need to construct the new entry
+          DATE=$(date +%Y-%m-%d)
+
+          # Create a temporary file for the new entry
+          cat > new_entry.md << EOF
+          ## [$NEW_VERSION] - $DATE
+
+          EOF
+
+          # Append the body from release_notes.md (excluding installation section)
+          # Our release_notes.md starts with "## What's Changed". 
+          # Extract only the release notes (up to but not including "## Installation")
+          # Replace ## with ### to maintain proper header hierarchy
+          sed '/^## Installation$/,$d' release_notes.md | sed 's/^## /### /' >> new_entry.md
+          echo "" >> new_entry.md
+
+          # If CHANGELOG.md exists (which it should now), we need to insert new_entry.md after the header
+          # Assuming the first line is "# CHANGELOG"
+
+          # Create a temp file with the header
+          echo "# CHANGELOG" > temp_changelog.md
+          echo "" >> temp_changelog.md
+
+          # Add the new entry
+          cat new_entry.md >> temp_changelog.md
+
+          # Add the rest of the existing changelog (skipping the first 2 lines: header and empty line)
+          tail -n +3 CHANGELOG.md >> temp_changelog.md || true
+
+          # Replace CHANGELOG.md
+          mv temp_changelog.md CHANGELOG.md
+
+          echo "✅ Updated CHANGELOG.md"
+
+      - name: Commit version bump
+        if: steps.check_version.outputs.should_release == 'true'
+        run: |
+          NEW_VERSION="${{ steps.version_bump.outputs.new_version }}"
+
+          # Configure git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Stage and commit changes
+          git add auto_claude.sh auto_claude.sh.sha256 CHANGELOG.md
+          git commit -m ":bookmark: Release version $NEW_VERSION"
+
+          # Push to main
+          git push origin main
+
+          echo "✅ Committed and pushed version bump to main"
+
+      - name: Create Release
+        if: steps.check_version.outputs.should_release == 'true'
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.version_bump.outputs.new_version }}
+          name: Release ${{ steps.version_bump.outputs.new_version }}
+          bodyFile: release_notes.md
+          draft: false
+          prerelease: false
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Release Summary
+        if: steps.check_version.outputs.should_release == 'true'
+        run: |
+          echo "🎉 Released ${{ steps.version_bump.outputs.new_version }}"
+          echo "📦 Bump type: ${{ steps.version_bump.outputs.bump_type }}"
